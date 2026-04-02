@@ -1,0 +1,4 @@
+forge.home {
+	tls internal
+	reverse_proxy forge-app:8080
+}
