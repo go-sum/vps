@@ -12,8 +12,7 @@ Two binaries handle separate concerns:
 
 - **Caddy Reverse Proxy** — Automatic Caddyfile generation from registered apps with internal TLS, hot-reload on app add/remove
 - **Docker Compose Orchestration** — Build and manage multi-service stacks (app, PostgreSQL, Dragonfly KV) with health checks
-- **Zero-Downtime Deploys** — Build new image, migrate schema, restart app, verify health — rollback automatically on failure
-- **Schema Migrations** — Runs pgschema against PostgreSQL with automatic extension installation (citext, pgcrypto)
+- **Zero-Downtime Deploys** — Build new image, restart app, verify health — rollback automatically on failure
 - **Commit-SHA Tracking** — Skips redundant deploys when the same commit is already running; override with `--force`
 - **Rollback** — Stores previous image ID and compose file; one command to restore
 - **Resource Monitoring** — `deploy status` and `admin status` show CPU, memory, and PID usage per container
@@ -71,7 +70,7 @@ admin app add forge \
 # 3. Create the app's .env file with production secrets
 vim /opt/apps/forge/.env
 
-# 4. Provision infrastructure (PostgreSQL, Dragonfly, tools image)
+# 4. Provision infrastructure (PostgreSQL, Dragonfly)
 export GITHUB_ACCESS_TOKEN=ghp_...
 deploy setup forge
 
@@ -150,8 +149,8 @@ admin app remove myapp
 
 | Command | Description |
 |---------|-------------|
-| `deploy setup <app>` | Clone repo, build infrastructure images (db, kv, tools), start services |
-| `deploy run <app>` | Build app image, apply schema, restart, health check, rollback on failure |
+| `deploy setup <app>` | Clone repo, build infrastructure images (db, kv), start services |
+| `deploy run <app>` | Build app image, restart, health check, rollback on failure |
 | `deploy status <app>` | Show deployment state, network connectivity, container resource usage |
 | `deploy rollback <app>` | Restore previous image and compose file, restart app |
 
@@ -209,8 +208,6 @@ compose_file: docker-compose.yml                    # Compose file in repo
 env_file: .env                                      # Secrets file (relative to app dir)
 health_url: https://localhost/health                # Health check endpoint (empty = skip)
 health_retries: 30                                  # Max health check attempts (2s interval)
-schema_file: db/sql/schema.sql                      # Schema file for pgschema
-schema_timeout: 120                                 # Migration timeout in seconds
 internal_tls: true                                  # Caddy internal TLS
 github_token_env: GITHUB_ACCESS_TOKEN               # Env var name for GitHub PAT
 ```
@@ -230,10 +227,6 @@ DATABASE_URL=postgres://postgres:secret@db:5432/mydb?sslmode=disable
 PGUSER=postgres
 PGPASSWORD=secret
 PGDATABASE=mydb
-PGSCHEMA_PLAN_HOST=db
-PGSCHEMA_PLAN_DB=postgres
-PGSCHEMA_PLAN_USER=postgres
-PGSCHEMA_PLAN_PASSWORD=secret
 # ... application-specific secrets
 ```
 
@@ -245,11 +238,11 @@ The application repository must contain:
 |----------------|---------|
 | `.versions` | Version pins (`GO_VERSION=1.26`, `PG_VERSION=18`, etc.) |
 | `docker-compose.yml` | Service definitions (app, db, kv) |
-| `docker/app/Dockerfile` | Multi-stage build with `production_target` and `cli_toolchain` targets |
+| `docker/app/Dockerfile` | Multi-stage build with `production_target` target |
 | `docker/postgres/Dockerfile` | PostgreSQL image build |
 | `docker/dragonfly/Dockerfile` | Dragonfly KV image build |
-| `db/sql/schema.sql` | Database schema (used by pgschema) |
-| `db/init/01-extensions.sql` | PostgreSQL extensions (citext, pgcrypto) |
+| `db/migrations/` | Versioned SQL migration files (applied by app on startup via goose) |
+| `db/init/01-extensions.sql` | PostgreSQL extensions (citext) |
 
 ---
 
@@ -306,12 +299,10 @@ The `deploy run` command performs these steps in order:
 4. **Save State** — Record current image ID and compose file for rollback
 5. **Build** — `docker build --target production_target` with version build-args and GitHub token secret
 6. **Tag** — Tag new image as `<app>:latest`
-7. **Verify Tools** — Check tools image fingerprint; rebuild if missing
-8. **Copy Artifacts** — Copy compose file, docker/, db/ to app directory
-9. **Extensions** — Install citext/pgcrypto in app database, plan database, and template1
-10. **Migrate** — Run `pgschema apply` via tools container on the app network
-11. **Restart** — `docker compose up -d --force-recreate --no-deps app`
-12. **Network** — Connect app container to Caddy network
-13. **Health Check** — Poll health URL up to 30 times at 2s intervals
-14. **Record** — Write deployed SHA; clear rollback state
-15. **Rollback** (on failure) — Restore previous image, compose file, and restart
+7. **Copy Artifacts** — Copy compose file, docker/, db/ to app directory
+8. **Restart** — `docker compose up -d --force-recreate --no-deps app`
+9. **Migrate** — App applies pending goose migrations on startup (`auto_migrate: true`)
+10. **Network** — Connect app container to Caddy network
+11. **Health Check** — Poll health URL up to 30 times at 2s intervals
+12. **Record** — Write deployed SHA; clear rollback state
+13. **Rollback** (on failure) — Restore previous image, compose file, and restart
