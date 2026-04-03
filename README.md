@@ -22,38 +22,6 @@ Two binaries handle separate concerns:
 
 ---
 
-## Installation
-
-### Prerequisites
-
-- Go 1.26+ (build machine only)
-- Docker and Docker Compose plugin (target server)
-- Git (target server)
-
-### Build
-
-```bash
-# Clone the repository
-git clone https://github.com/go-sum/vps.git
-cd vps
-
-# Build for the local machine
-go build -o bin/admin ./cmd/admin
-go build -o bin/deploy ./cmd/deploy
-
-# Cross-compile for x86_64 Linux (e.g., Debian VPS)
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/admin ./cmd/admin
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/deploy ./cmd/deploy
-```
-
-### Deploy to Server
-
-```bash
-scp bin/admin bin/deploy user@server:/usr/local/bin/
-```
-
----
-
 ## Usage
 
 ### Initial Server Setup
@@ -63,9 +31,7 @@ scp bin/admin bin/deploy user@server:/usr/local/bin/
 admin setup
 
 # 2. Register an application
-admin app add forge \
-  --repo https://github.com/go-sum/forge.git \
-  --domain forge.home
+admin app add forge --repo https://github.com/go-sum/forge.git --domain forge.home
 
 # 3. Create the app's .env file with production secrets
 vim /opt/apps/forge/.env
@@ -119,6 +85,38 @@ admin app add myapp \
 
 # Remove an app (removes config and updates Caddyfile)
 admin app remove myapp
+```
+
+---
+
+## Installation
+
+### Prerequisites
+
+- Go 1.26+ (build machine only)
+- Docker and Docker Compose plugin (target server)
+- Git (target server)
+
+### Build
+
+```bash
+# Clone the repository
+git clone https://github.com/go-sum/vps.git
+cd vps
+
+# Build for the local machine
+go build -o bin/admin ./cmd/admin
+go build -o bin/deploy ./cmd/deploy
+
+# Cross-compile for x86_64 Linux (e.g., Debian VPS)
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/admin ./cmd/admin
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/deploy ./cmd/deploy
+```
+
+### Deploy to Server
+
+```bash
+scp bin/admin bin/deploy user@server:/usr/local/bin/
 ```
 
 ---
@@ -223,7 +221,6 @@ github_token_env: GITHUB_ACCESS_TOKEN               # Env var name for GitHub PA
 Must be created manually before running `deploy setup`. Contains production secrets read by Docker Compose and the application:
 
 ```env
-DATABASE_URL=postgres://postgres:secret@db:5432/mydb?sslmode=disable
 PGUSER=postgres
 PGPASSWORD=secret
 PGDATABASE=mydb
