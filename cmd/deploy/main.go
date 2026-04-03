@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -154,24 +153,6 @@ func runSetup(ctx context.Context, appName string) error {
 		}
 	}
 
-	// Build tools image.
-	fmt.Println("==> Building tools image")
-	toolsFingerprint := fmt.Sprintf("go%s-pgschema%s-sqlc%s",
-		versions["GO_VERSION"], versions["PGSCHEMA_VERSION"], versions["SQLC_VERSION"])
-
-	if err := docker.Build(ctx, docker.BuildOpts{
-		ContextDir: srcDir,
-		Dockerfile: filepath.Join(srcDir, "docker", "app", "Dockerfile"),
-		Target:     "cli_toolchain",
-		Tag:        appCfg.ToolsImage(),
-		BuildArgs:  repo.BuildArgsFromVersions(versions),
-		Labels: map[string]string{
-			"tools.versions.fingerprint": toolsFingerprint,
-		},
-	}); err != nil {
-		return fmt.Errorf("build tools: %w", err)
-	}
-
 	// Start infrastructure services.
 	fmt.Println("==> Starting database and KV services")
 	if err := docker.ComposeUp(ctx, opts, []string{"db", "kv"}, true); err != nil {
@@ -188,7 +169,6 @@ func runSetup(ctx context.Context, appName string) error {
 	fmt.Println("")
 	fmt.Println("==> Infrastructure provisioning complete")
 	fmt.Printf("    App dir:  %s\n", appDir)
-	fmt.Printf("    Tools:    %s\n", toolsFingerprint)
 	fmt.Println("")
 	fmt.Println("    Next: deploy run " + appName)
 	return nil
@@ -313,94 +293,14 @@ func runDeploy(ctx context.Context, appName string, force bool, branchOverride s
 		return fmt.Errorf("tag app image: %w", err)
 	}
 
-	// Verify tools image.
-	toolsFingerprint := fmt.Sprintf("go%s-pgschema%s-sqlc%s",
-		versions["GO_VERSION"], versions["PGSCHEMA_VERSION"], versions["SQLC_VERSION"])
-	existingFP, _ := docker.InspectLabel(ctx, appCfg.ToolsImage(), "tools.versions.fingerprint")
-
-	if existingFP == "" {
-		fmt.Println("WARNING: Tools image not found. Building inline as fallback...")
-		if err := docker.Build(ctx, docker.BuildOpts{
-			ContextDir: srcDir,
-			Dockerfile: filepath.Join(srcDir, "docker", "app", "Dockerfile"),
-			Target:     "cli_toolchain",
-			Tag:        appCfg.ToolsImage(),
-			BuildArgs:  repo.BuildArgsFromVersions(versions),
-			Labels: map[string]string{
-				"tools.versions.fingerprint": toolsFingerprint,
-			},
-		}); err != nil {
-			return fmt.Errorf("build tools (fallback): %w", err)
-		}
-	} else if existingFP != toolsFingerprint {
-		fmt.Printf("WARNING: Tools image outdated (have: %s, need: %s)\n", existingFP, toolsFingerprint)
-		fmt.Println("         Run 'deploy setup' to rebuild. Proceeding with existing image.")
-	}
-
 	// Copy artifacts.
 	fmt.Println("==> Copying artifacts")
 	if err := copyArtifacts(srcDir, appDir, appCfg.ComposeFile); err != nil {
 		return err
 	}
 
-	// Apply schema migration.
-	network := appCfg.ProjectName + "_app_network"
-	dbURL := readEnvValue(envPath, "DATABASE_URL")
-	if dbURL != "" && appCfg.SchemaFile != "" {
-		// Ensure extensions exist in both the app database and template1.
-		// pgschema creates a temp database for diff computation — extensions
-		// must be in template1 so they're inherited by the temp database.
-		// Uses docker exec on the running db container (which has psql).
-		fmt.Println("==> Installing database extensions")
-		dbContainer := appCfg.ProjectName + "-db-1"
-		extSQL := "CREATE EXTENSION IF NOT EXISTS citext; CREATE EXTENSION IF NOT EXISTS pgcrypto;"
-		// Install in the app database, the pgschema plan database, and template1.
-		// pgschema creates a temp schema inside PGSCHEMA_PLAN_DB for diff computation,
-		// so that database must have the extensions too.
-		planDB := readEnvValue(envPath, "PGSCHEMA_PLAN_DB")
-		if planDB == "" {
-			planDB = "postgres"
-		}
-		for _, db := range dedup(dbName(dbURL), planDB, "template1") {
-			_ = docker.Exec(ctx, dbContainer, []string{"psql", "-U", "postgres", "-d", db, "-c", extSQL})
-		}
-
-		fmt.Printf("==> Applying schema (timeout: %ds)\n", appCfg.SchemaTimeout)
-
-		schemaCtx, schemaCancel := context.WithTimeout(ctx, time.Duration(appCfg.SchemaTimeout)*time.Second)
-		defer schemaCancel()
-
-		// pgschema uses PGSCHEMA_PLAN_* to connect to a database where it
-		// creates temporary schemas for diff computation. In dev this is the
-		// schema_data service; in production we point it at the main db.
-		pgUser := readEnvValue(envPath, "PGUSER")
-		if pgUser == "" {
-			pgUser = "postgres"
-		}
-		pgPassword := readEnvValue(envPath, "PGPASSWORD")
-		if pgPassword == "" {
-			pgPassword = "postgres"
-		}
-		schemaEnv := map[string]string{
-			"DATABASE_URL":          dbURL,
-			"PGSCHEMA_PLAN_HOST":    "db",
-			"PGSCHEMA_PLAN_DB":      "postgres",
-			"PGSCHEMA_PLAN_USER":    pgUser,
-			"PGSCHEMA_PLAN_PASSWORD": pgPassword,
-		}
-
-		if err := docker.Run(schemaCtx, docker.RunOpts{
-			Image:   appCfg.ToolsImage(),
-			Remove:  true,
-			WorkDir: "/app",
-			Network: network,
-			Volumes: []string{appDir + ":/app"},
-			Env:     schemaEnv,
-			Cmd:     []string{"pgschema", "apply", "--file", appCfg.SchemaFile, "--auto-approve"},
-		}); err != nil {
-			return fmt.Errorf("schema migration failed: %w", err)
-		}
-	}
+	// Migrations are applied by the app on startup (auto_migrate: true in config).
+	// Extensions are installed by db/init/01-extensions.sql at container creation.
 
 	// Start or restart app.
 	if prevImageID == "" {
@@ -659,76 +559,4 @@ func hashFile(path string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
-}
-
-// readEnvValue reads a specific KEY=VALUE from an env file.
-func readEnvValue(envPath, key string) string {
-	data, err := os.ReadFile(envPath)
-	if err != nil {
-		return ""
-	}
-	prefix := key + "="
-	for _, line := range splitLines(string(data)) {
-		line = trimSpace(line)
-		if len(line) > len(prefix) && line[:len(prefix)] == prefix {
-			return line[len(prefix):]
-		}
-	}
-	return ""
-}
-
-func splitLines(s string) []string {
-	var lines []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			lines = append(lines, s[start:i])
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		lines = append(lines, s[start:])
-	}
-	return lines
-}
-
-// dedup returns unique strings preserving order.
-func dedup(vals ...string) []string {
-	seen := make(map[string]struct{}, len(vals))
-	out := make([]string, 0, len(vals))
-	for _, v := range vals {
-		if _, ok := seen[v]; !ok {
-			seen[v] = struct{}{}
-			out = append(out, v)
-		}
-	}
-	return out
-}
-
-// dbName extracts the database name from a PostgreSQL URL.
-// e.g. postgres://user:pass@host:5432/starter?sslmode=disable → "starter"
-func dbName(dsn string) string {
-	u, err := url.Parse(dsn)
-	if err != nil {
-		return "postgres"
-	}
-	name := u.Path
-	if len(name) > 0 && name[0] == '/' {
-		name = name[1:]
-	}
-	if name == "" {
-		return "postgres"
-	}
-	return name
-}
-
-func trimSpace(s string) string {
-	i, j := 0, len(s)
-	for i < j && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r') {
-		i++
-	}
-	for j > i && (s[j-1] == ' ' || s[j-1] == '\t' || s[j-1] == '\r') {
-		j--
-	}
-	return s[i:j]
 }

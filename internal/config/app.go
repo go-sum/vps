@@ -22,8 +22,6 @@ type AppConfig struct {
 	EnvFile       string `yaml:"env_file"`
 	HealthURL     string `yaml:"health_url"`
 	HealthRetries int    `yaml:"health_retries"`
-	SchemaFile    string `yaml:"schema_file"`
-	SchemaTimeout int    `yaml:"schema_timeout"`
 	InternalTLS   bool   `yaml:"internal_tls"`
 	GithubToken   string `yaml:"github_token_env"`
 }
@@ -48,12 +46,6 @@ func (a *AppConfig) ApplyDefaults() {
 	if a.HealthRetries == 0 {
 		a.HealthRetries = 30
 	}
-	if a.SchemaFile == "" {
-		a.SchemaFile = "db/sql/schema.sql"
-	}
-	if a.SchemaTimeout == 0 {
-		a.SchemaTimeout = 120
-	}
 	if a.GithubToken == "" {
 		a.GithubToken = "GITHUB_ACCESS_TOKEN"
 	}
@@ -63,11 +55,6 @@ func (a *AppConfig) ApplyDefaults() {
 // Convention: <project_name>-app-1
 func (a AppConfig) UpstreamHost() string {
 	return a.ProjectName + "-app-1"
-}
-
-// ToolsImage returns the Docker image name for the tools container.
-func (a AppConfig) ToolsImage() string {
-	return a.ProjectName + "-tools"
 }
 
 // AppImage returns the Docker image name used for the app.
