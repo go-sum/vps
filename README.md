@@ -35,7 +35,7 @@ Two binaries handle separate concerns:
 
 ```bash
 # Clone the repository
-git clone https://github.com/caasmo/vps.git
+git clone https://github.com/go-sum/vps.git
 cd vps
 
 # Build for the local machine
@@ -65,7 +65,7 @@ admin setup
 
 # 2. Register an application
 admin app add forge \
-  --repo https://github.com/user/forge.git \
+  --repo https://github.com/go-sum/forge.git \
   --domain forge.home
 
 # 3. Create the app's .env file with production secrets
@@ -175,12 +175,9 @@ admin app remove myapp
 | Technology | Purpose |
 |------------|---------|
 | [Go](https://go.dev/) | CLI implementation, cross-compilation |
-| [Cobra](https://github.com/spf13/cobra) | CLI framework (commands, flags, help) |
 | [Docker](https://www.docker.com/) | Container builds and orchestration |
 | [Docker Compose](https://docs.docker.com/compose/) | Multi-service stack management |
 | [Caddy](https://caddyserver.com/) | Reverse proxy with automatic TLS |
-| [pgschema](https://github.com/pgplex/pgschema) | Declarative PostgreSQL schema migrations |
-| [YAML](https://yaml.org/) | Configuration file format |
 
 ---
 
@@ -192,7 +189,7 @@ Created by `admin setup`. Controls the directory layout and network settings.
 
 ```yaml
 base_dir: /opt                # Root directory
-caddy_dir: /opt/vps/caddy    # Caddy compose file and Caddyfile
+caddy_dir: /opt/vps/caddy     # Caddy compose file and Caddyfile
 apps_dir: /opt/apps           # Per-app deployment directories
 caddy_network: caddy_net      # Docker network connecting Caddy to apps
 ```
@@ -203,14 +200,14 @@ Created by `admin app add`. Controls how the app is built, deployed, and proxied
 
 ```yaml
 name: forge                                         # App identifier
-repo: https://github.com/user/forge.git             # Git clone URL
+repo: https://github.com/go-sum/forge.git           # Git clone URL
 branch: main                                        # Branch to deploy
 domain: forge.home                                  # Caddy domain
 upstream_port: 8080                                 # Container port
 project_name: forge-prod                            # Docker Compose project name
 compose_file: docker-compose.yml                    # Compose file in repo
 env_file: .env                                      # Secrets file (relative to app dir)
-health_url: https://localhost/health                 # Health check endpoint (empty = skip)
+health_url: https://localhost/health                # Health check endpoint (empty = skip)
 health_retries: 30                                  # Max health check attempts (2s interval)
 schema_file: db/sql/schema.sql                      # Schema file for pgschema
 schema_timeout: 120                                 # Migration timeout in seconds

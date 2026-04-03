@@ -1,0 +1,18 @@
+{{- range .Apps}}
+{{.Domain}} {
+{{- if .InternalTLS}}
+	tls internal
+{{- end}}
+	reverse_proxy {{.UpstreamHost}}:{{.UpstreamPort}}
+}
+
+{{end -}}
+# Catch-all: reject unmatched hosts (direct IP, unknown domains)
+:80 {
+	respond 444
+}
+
+:443 {
+	tls internal
+	respond 444
+}

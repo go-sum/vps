@@ -1,35 +1,56 @@
 package caddy
 
 import (
+	"bytes"
 	"context"
+	_ "embed"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
+	"text/template"
 
 	"github.com/caasmo/vps/internal/config"
 )
 
-// GenerateCaddyfile builds a complete Caddyfile from all registered apps.
-// Each app gets a server block with reverse_proxy pointing to its upstream.
-func GenerateCaddyfile(apps []config.AppConfig) string {
-	var b strings.Builder
+//go:embed caddyfile.tmpl
+var caddyfileTmpl string
 
+var tmpl = template.Must(template.New("Caddyfile").Parse(caddyfileTmpl))
+
+// templateData is the context passed to the Caddyfile template.
+type templateData struct {
+	Apps []templateApp
+}
+
+// templateApp exposes the fields the template needs.
+// This decouples the template from config.AppConfig's method names.
+type templateApp struct {
+	Domain       string
+	InternalTLS  bool
+	UpstreamHost string
+	UpstreamPort int
+}
+
+// GenerateCaddyfile builds a complete Caddyfile from all registered apps
+// by executing the embedded caddyfile.tmpl template.
+func GenerateCaddyfile(apps []config.AppConfig) string {
+	data := templateData{Apps: make([]templateApp, len(apps))}
 	for i, app := range apps {
-		if i > 0 {
-			b.WriteString("\n")
+		data.Apps[i] = templateApp{
+			Domain:       app.Domain,
+			InternalTLS:  app.InternalTLS,
+			UpstreamHost: app.UpstreamHost(),
+			UpstreamPort: app.UpstreamPort,
 		}
-		b.WriteString(app.Domain)
-		b.WriteString(" {\n")
-		if app.InternalTLS {
-			b.WriteString("\ttls internal\n")
-		}
-		b.WriteString(fmt.Sprintf("\treverse_proxy %s:%d\n", app.UpstreamHost(), app.UpstreamPort))
-		b.WriteString("}\n")
 	}
 
-	return b.String()
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		// Template is compiled at init; execution errors indicate a bug.
+		panic(fmt.Sprintf("caddyfile template: %v", err))
+	}
+	return buf.String()
 }
 
 // WriteCaddyfile writes the Caddyfile to the Caddy config directory.
