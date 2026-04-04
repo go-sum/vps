@@ -12,9 +12,12 @@ Two binaries handle separate concerns:
 
 - **Caddy Reverse Proxy** — Automatic Caddyfile generation from registered apps with internal TLS, hot-reload on app add/remove
 - **Docker Compose Orchestration** — Build and manage multi-service stacks (app, PostgreSQL, Dragonfly KV) with health checks
-- **Zero-Downtime Deploys** — Build new image, restart app, verify health — rollback automatically on failure
-- **Commit-SHA Tracking** — Skips redundant deploys when the same commit is already running; override with `--force`
+- **Two Deployment Paths** — Build on the server (`deploy run`) or pull a pre-built image from GHCR (`deploy pull`); both produce the same production image
+- **Zero-Downtime Deploys** — Build or pull new image, restart app, verify health — rollback automatically on failure
+- **Commit-SHA Tracking** — Tags images with commit SHA; skips redundant deploys when the same commit is already running; override with `--force`
+- **Registry Integration** — Build production images in GitHub Actions, push to GHCR, pull to any server — no on-server compilation needed
 - **Rollback** — Stores previous image ID and compose file; one command to restore
+- **Conditional Infrastructure** — KV service (Dragonfly) only provisioned when `DRAGONFLY_VERSION` is present in `.versions`
 - **Resource Monitoring** — `deploy status` and `admin status` show CPU, memory, and PID usage per container
 - **Caddy Network Visibility** — `admin status` lists all containers connected to the Caddy network with resource usage
 - **Embedded Templates** — Caddy docker-compose.yml is compiled into the binary; no source tree needed on the server
@@ -24,6 +27,18 @@ Two binaries handle separate concerns:
 
 ## Usage
 
+> Throughout the usage and installation examples, the `forge` repo is refrenced. for example instead of:
+
+```bash
+# 2. Register an application
+admin app add `<appname>` --repo `<repository>` --domain `<domain>`
+```
+> you'll see (replace where appropriate)
+```bash
+# 2. Register an application
+admin app add forge --repo https://github.com/go-sum/forge.git --domain forge.home
+```
+
 ### Initial Server Setup
 
 ```bash
@@ -31,20 +46,29 @@ Two binaries handle separate concerns:
 admin setup
 
 # 2. Register an application
+admin app add `<appname>` --repo `<repository>` --domain `<domain>`
+## Example:
 admin app add forge --repo https://github.com/go-sum/forge.git --domain forge.home
 
 # 3. Create the app's .env file with production secrets
+vim /opt/apps/`<appname>`/.env
+## Example:
 vim /opt/apps/forge/.env
 
-# 4. Provision infrastructure (PostgreSQL, Dragonfly)
+# 4. Provision infrastructure (PostgreSQL, and Dragonfly if DRAGONFLY_VERSION is in .versions)
 export GITHUB_ACCESS_TOKEN=ghp_...
+deploy setup `<appname>`
+## Example:
 deploy setup forge
-
-# 5. Deploy the application
-deploy run forge
 ```
 
-### Subsequent Deployments
+### Deployment options
+
+Two deployment paths are possible:
+
+#### Option A: Build on Server (`deploy run`)
+
+Clones the repo on the server, builds the production tools image (cached), builds the app image, and restarts. Best for fast iteration when the server has sufficient resources.
 
 ```bash
 # Deploy latest commit from configured branch
@@ -55,8 +79,31 @@ deploy run forge --branch staging
 
 # Force deploy even if same commit is already running
 deploy run forge --force
+```
 
-# Roll back to previous version
+#### Option B: Pull from Registry (`deploy pull`)
+
+Pulls a pre-built image from GHCR and restarts. No compilation on the server — only a sparse checkout of orchestration files (compose, db/, .versions). Best for production servers with limited resources or when build consistency matters.
+
+```bash
+# Prerequisites (one-time):
+# 1. Configure registry in app.yaml (see Configuration below)
+# 2. Set GHCR_TOKEN env var on the server (PAT with read:packages scope)
+# 3. Trigger a CI build via GitHub Actions (workflow_dispatch or tag push)
+
+# Pull latest image from registry
+deploy pull forge
+
+# Pull a specific tagged version
+deploy pull forge --tag v1.0
+
+# Pull a specific commit build
+deploy pull forge --tag abc123f
+```
+
+#### Rollback (works with both options)
+
+```bash
 deploy rollback forge
 ```
 
@@ -147,10 +194,11 @@ scp bin/admin bin/deploy user@server:/usr/local/bin/
 
 | Command | Description |
 |---------|-------------|
-| `deploy setup <app>` | Clone repo, build infrastructure images (db, kv), start services |
-| `deploy run <app>` | Build app image, restart, health check, rollback on failure |
+| `deploy setup <app>` | Clone repo, build infrastructure images (db, kv if configured), start services |
+| `deploy run <app>` | Build tools + app image on server, restart, health check, rollback on failure |
+| `deploy pull <app>` | Pull pre-built image from GHCR, fetch artifacts, restart, health check, rollback on failure |
 | `deploy status <app>` | Show deployment state, network connectivity, container resource usage |
-| `deploy rollback <app>` | Restore previous image and compose file, restart app |
+| `deploy rollback <app>` | Restore previous image and compose file, restart app, re-run health check |
 
 **`deploy run` flags:**
 
@@ -158,6 +206,12 @@ scp bin/admin bin/deploy user@server:/usr/local/bin/
 |------|---------|-------------|
 | `--force` | `false` | Deploy even if the same commit SHA is already deployed |
 | `--branch` | (from app.yaml) | Override the configured branch for this deploy |
+
+**`deploy pull` flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--tag` | `latest` | Image tag to pull (e.g., `v1.0`, commit SHA, or `latest`) |
 
 **Global flag (both binaries):**
 
@@ -172,7 +226,7 @@ scp bin/admin bin/deploy user@server:/usr/local/bin/
 | Technology | Purpose |
 |------------|---------|
 | [Go](https://go.dev/) | CLI implementation, cross-compilation |
-| [Docker](https://www.docker.com/) | Container builds and orchestration |
+| [Docker](https://www.docker.com/) | Container builds and orchestration (BuildKit secrets for private modules) |
 | [Docker Compose](https://docs.docker.com/compose/) | Multi-service stack management |
 | [Caddy](https://caddyserver.com/) | Reverse proxy with automatic TLS |
 
@@ -208,13 +262,16 @@ health_url: https://localhost/health                # Health check endpoint (emp
 health_retries: 30                                  # Max health check attempts (2s interval)
 internal_tls: true                                  # Caddy internal TLS
 github_token_env: GITHUB_ACCESS_TOKEN               # Env var name for GitHub PAT
+registry_image: ghcr.io/go-sum/forge                # GHCR image path (required for deploy pull)
+registry_token_env: GHCR_TOKEN                      # Env var name for registry auth (default: GHCR_TOKEN)
 ```
 
 ### Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `GITHUB_ACCESS_TOKEN` | Yes (deploy) | GitHub PAT for cloning private repos and downloading private Go modules |
+| Variable | Required By | Description |
+|----------|-------------|-------------|
+| `GITHUB_ACCESS_TOKEN` | `deploy run`, `deploy setup` | GitHub PAT for cloning private repos and downloading private Go modules during on-server builds |
+| `GHCR_TOKEN` | `deploy pull` | GitHub PAT with `read:packages` scope for pulling images from GHCR |
 
 ### App `.env` File (`/opt/apps/<name>/.env`)
 
@@ -233,13 +290,16 @@ The application repository must contain:
 
 | File/Directory | Purpose |
 |----------------|---------|
-| `.versions` | Version pins (`GO_VERSION=1.26`, `PG_VERSION=18`, etc.) |
-| `docker-compose.yml` | Service definitions (app, db, kv) |
-| `docker/app/Dockerfile` | Multi-stage build with `production_target` target |
+| `.versions` | Version pins (`GO_VERSION=1.26`, `PG_VERSION=18`, etc.) — all non-empty values passed as `--build-arg` |
+| `docker-compose.yml` | Production service definitions (app, db, kv) |
+| `docker/app/Dockerfile` | Multi-stage app build with `production_target` target — references pre-built `forge-tools:prod` image for production toolchain |
+| `docker/tools/` | Toolchain Dockerfile (`dev_tools` and `production_tools` targets), installation scripts (`dev-tools.sh`, `prod-tools.sh`) |
 | `docker/postgres/Dockerfile` | PostgreSQL image build |
-| `docker/dragonfly/Dockerfile` | Dragonfly KV image build |
-| `db/migrations/` | Versioned SQL migration files (applied by app on startup via goose) |
+| `docker/dragonfly/Dockerfile` | Dragonfly KV image build (only required if `DRAGONFLY_VERSION` is in `.versions`) |
+| `db/migrations/` | Versioned SQL migration files (applied by the app on startup when `auto_migrate: true`) |
 | `db/init/01-extensions.sql` | PostgreSQL extensions (citext) |
+
+Both `deploy run` and `deploy pull` copy the `docker/` directory to the app directory. `deploy run` builds the production tools image (`docker/tools/Dockerfile` target `production_tools`) on the server before building the app — this image is cached and only rebuilds when Hugo or Tailwind versions change. `deploy pull` skips all building and pulls a pre-built image from GHCR instead.
 
 ---
 
@@ -278,28 +338,104 @@ After setup, the server filesystem looks like:
         ├── .env                    # Production secrets
         ├── .deployed_sha           # Current deployed commit
         ├── .previous_image_id      # Rollback image reference
+        ├── .versions_hash          # SHA256 of .versions at last setup
         ├── docker-compose.yml      # Copied from repo at deploy time
         ├── docker-compose.yml.prev # Previous version (for rollback)
-        ├── docker/                 # Copied from repo
+        ├── docker/                 # Copied from repo (app/, tools/, postgres/, dragonfly/)
         └── db/                     # Copied from repo
 ```
 
 ---
 
-## Deploy Workflow
+## Deploy Workflows
 
-The `deploy run` command performs these steps in order:
+Both workflows share the same restart, health check, and rollback logic. They differ only in how the production image is obtained.
 
-1. **Validate** — Check Docker, .env file, GitHub token, running infrastructure
-2. **Clone** — Shallow clone of the configured branch to a temp directory
-3. **SHA Check** — Skip if already deployed at this commit (unless `--force`)
-4. **Save State** — Record current image ID and compose file for rollback
-5. **Build** — `docker build --target production_target` with version build-args and GitHub token secret
-6. **Tag** — Tag new image as `<app>:latest`
-7. **Copy Artifacts** — Copy compose file, docker/, db/ to app directory
-8. **Restart** — `docker compose up -d --force-recreate --no-deps app`
-9. **Migrate** — App applies pending goose migrations on startup (`auto_migrate: true`)
+### `deploy run` — Build on Server
+
+1. **Validate** — Check Docker, .env file, GitHub token, running infrastructure (db, kv)
+2. **Clone** — Shallow clone (`--depth 1`) of the configured branch to a temp directory
+3. **Parse Versions** — Read all `KEY=VALUE` pairs from `.versions`; filter empty values
+4. **SHA Check** — Skip if already deployed at this commit (unless `--force`)
+5. **Save State** — Record current image ID and compose file (`.prev`) for rollback
+6. **Build Tools** — `docker build --target production_tools` from `docker/tools/Dockerfile` — cached unless Hugo or Tailwind versions change
+7. **Build App** — `docker build --target production_target` from `docker/app/Dockerfile` with version build-args, tools image reference, and GitHub token as a BuildKit secret
+8. **Tag** — Tag new image as `<app>:<sha>` and `<app>:latest`
+9. **Copy Artifacts** — Copy compose file, `docker/`, and `db/` to app directory
+10. **Restart** — First deploy: `docker compose up -d`; subsequent: `docker compose up -d --force-recreate --no-deps app`
+11. **Network** — Connect app container to Caddy network
+12. **Health Check** — Poll health URL up to `health_retries` times at 2s intervals with 5s timeout per request
+13. **Record** — Write deployed SHA; clear rollback state
+14. **Rollback** (on failure) — Show last 50 lines of app logs, restore previous image and compose file, restart
+
+### `deploy pull` — Pull from Registry
+
+1. **Validate** — Check Docker, `registry_image` configured, `GHCR_TOKEN` set, running infrastructure (db, kv)
+2. **Login** — Authenticate to GHCR via `docker login --password-stdin`
+3. **Pull** — `docker pull ghcr.io/<owner>/<app>:<tag>`
+4. **Save State** — Record current image ID and compose file (`.prev`) for rollback
+5. **Tag** — Tag pulled image as `<app>:latest`
+6. **Fetch Artifacts** — Sparse git checkout of `docker-compose.yml`, `docker/`, `db/`, `.versions` (~100KB)
+7. **Copy Artifacts** — Copy fetched files to app directory
+8. **Parse Versions** — Read `.versions` for compose environment
+9. **Restart** — Same as `deploy run` step 10
 10. **Network** — Connect app container to Caddy network
-11. **Health Check** — Poll health URL up to 30 times at 2s intervals
-12. **Record** — Write deployed SHA; clear rollback state
-13. **Rollback** (on failure) — Restore previous image, compose file, and restart
+11. **Health Check** — Same as `deploy run` step 12
+12. **Record** — Write deployed tag; clear rollback state
+13. **Rollback** (on failure) — Same as `deploy run` step 14
+
+### GitHub Actions CI Build
+
+The repository includes a workflow (`.github/workflows/build-image.yml`) that builds the production image and pushes it to GHCR. It is triggered by:
+
+- **Manual dispatch** (`workflow_dispatch`) — with an optional `tag` input
+- **Tag push** (`v*`) — uses the git tag as the image tag
+
+The workflow builds the same `production_target` as `deploy run`, tags the image as both `:<tag>` and `:latest`, and cleans up old versions (keeps the last 5).
+
+**Required GitHub Secrets:**
+
+| Secret | Description |
+|--------|-------------|
+| `PACKAGES_TOKEN` | GitHub PAT with `read:packages` (private Go modules) + `write:packages` (GHCR push) |
+
+`GITHUB_TOKEN` handles GHCR authentication for push. 
+`PACKAGES_TOKEN` is passed as a BuildKit secret for downloading private Go modules during the build.
+
+Migrations are handled by the application itself on startup when `auto_migrate: true` is set in its config — the deploy tool does not run migrations directly.
+
+---
+
+## GitHub Quick Reference
+
+### Creating a Personal Access Token (PAT)
+
+Go to **Settings > Developer settings > Personal access tokens > Fine-grained tokens** and create two tokens:
+
+1. **`PACKAGES_TOKEN`** (for CI / `deploy run`) — scopes: `read:packages`, `write:packages`
+2. **`GHCR_TOKEN`** (for `deploy pull`) — scope: `read:packages` only
+
+See [Managing your personal access tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens) for detailed instructions.
+
+### Adding Repository Secrets
+
+Go to your repo **Settings > Secrets and variables > Actions > New repository secret** and add `PACKAGES_TOKEN` with the CI token value.
+
+See [Using secrets in GitHub Actions](https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions) for detailed instructions.
+
+### Triggering a Workflow Manually
+
+Go to your repo **Actions** tab, select the **Build and Push Production Image** workflow, click **Run workflow**, optionally enter a tag, and click the green **Run workflow** button.
+
+See [Manually running a workflow](https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/manually-running-a-workflow) for detailed instructions.
+
+### Pushing a Tag to Trigger a Build
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+This triggers the workflow automatically and tags the image as `v1.0.0`. 
+
+See [Git Basics - Tagging](https://git-scm.com/book/en/v2/Git-Basics-Tagging) for more on tag management.

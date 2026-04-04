@@ -34,6 +34,7 @@ func main() {
 
 	root.AddCommand(setupCmd())
 	root.AddCommand(runCmd())
+	root.AddCommand(pullCmd())
 	root.AddCommand(statusCmd())
 	root.AddCommand(rollbackCmd())
 
@@ -276,14 +277,33 @@ func runDeploy(ctx context.Context, appName string, force bool, branchOverride s
 		copyFile(composeDst, composeDst+".prev")
 	}
 
+	// Build production tools image (cached unless Hugo/Tailwind versions change).
+	fmt.Println("==> Building production tools image")
+	toolsBuildArgs := map[string]string{
+		"GO_VERSION":       versions["GO_VERSION"],
+		"HUGO_VERSION":     versions["HUGO_VERSION"],
+		"TAILWIND_VERSION": versions["TAILWIND_VERSION"],
+	}
+	if err := docker.Build(ctx, docker.BuildOpts{
+		ContextDir: filepath.Join(srcDir, "docker", "tools"),
+		Dockerfile: filepath.Join(srcDir, "docker", "tools", "Dockerfile"),
+		Target:     "production_tools",
+		Tag:        appCfg.AppImage() + "-tools:prod",
+		BuildArgs:  toolsBuildArgs,
+	}); err != nil {
+		return fmt.Errorf("build tools: %w", err)
+	}
+
 	// Build production image.
 	fmt.Printf("==> Building production image (commit: %.12s)\n", sha)
+	appBuildArgs := repo.BuildArgsFromVersions(versions)
+	appBuildArgs["TOOLS_PROD_IMAGE"] = appCfg.AppImage() + "-tools:prod"
 	if err := docker.Build(ctx, docker.BuildOpts{
 		ContextDir: srcDir,
 		Dockerfile: filepath.Join(srcDir, "docker", "app", "Dockerfile"),
 		Target:     "production_target",
 		Tag:        appCfg.AppImage() + ":" + sha,
-		BuildArgs:  repo.BuildArgsFromVersions(versions),
+		BuildArgs:  appBuildArgs,
 		Secrets:    []string{"id=github_token,env=" + appCfg.GithubToken},
 	}); err != nil {
 		return fmt.Errorf("build app: %w", err)
@@ -302,49 +322,8 @@ func runDeploy(ctx context.Context, appName string, force bool, branchOverride s
 	// Migrations are applied by the app on startup (auto_migrate: true in config).
 	// Extensions are installed by db/init/01-extensions.sql at container creation.
 
-	// Start or restart app.
-	if prevImageID == "" {
-		fmt.Println("==> Starting app service")
-		if err := docker.ComposeUp(ctx, opts, []string{"app"}, false); err != nil {
-			return fmt.Errorf("start app: %w", err)
-		}
-	} else {
-		fmt.Println("==> Restarting app service")
-		if err := docker.ComposeRecreate(ctx, opts, []string{"app"}); err != nil {
-			return fmt.Errorf("restart app: %w", err)
-		}
-	}
-
-	// Connect app to Caddy network.
-	containerName := appCfg.ProjectName + "-app-1"
-	_ = docker.NetworkConnect(ctx, vpsCfg.CaddyNetwork, containerName)
-
-	// Health check.
-	if appCfg.HealthURL != "" {
-		fmt.Println("==> Waiting for health check...")
-		if err := health.Check(ctx, appCfg.HealthURL, appCfg.HealthRetries, 2*time.Second); err != nil {
-			fmt.Printf("ERROR: %v\n", err)
-
-			// Show logs.
-			fmt.Println("==> Recent logs:")
-			_ = docker.ComposeLogs(ctx, opts, "app", 50)
-
-			// Rollback.
-			if prevImageID != "" {
-				fmt.Println("==> Rolling back to previous version...")
-				_ = docker.ComposeStop(ctx, opts, []string{"app"})
-				_ = docker.Tag(ctx, prevImageID, appCfg.AppImage()+":latest")
-				if _, err := os.Stat(composeDst + ".prev"); err == nil {
-					copyFile(composeDst+".prev", composeDst)
-				}
-				_ = docker.ComposeRecreate(ctx, opts, []string{"app"})
-				_ = docker.NetworkConnect(ctx, vpsCfg.CaddyNetwork, containerName)
-				fmt.Println("    Rolled back to previous version")
-			} else {
-				fmt.Println("    No previous version to roll back to (initial deploy)")
-			}
-			return fmt.Errorf("deployment failed: health check did not pass")
-		}
+	if err := restartWithHealthCheck(ctx, vpsCfg, appCfg, opts, prevImageID); err != nil {
+		return err
 	}
 
 	// Record successful deployment.
@@ -362,6 +341,194 @@ func runDeploy(ctx context.Context, appName string, force bool, branchOverride s
 		}
 		fmt.Printf("    URL:     %s://%s\n", scheme, appCfg.Domain)
 	}
+	return nil
+}
+
+// ── pull ──────────────────────────────────────────────────────────────────────
+
+func pullCmd() *cobra.Command {
+	var tag string
+
+	cmd := &cobra.Command{
+		Use:   "pull <app-name>",
+		Short: "Deploy from registry: pull pre-built image, restart with health check",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			return runPull(ctx, args[0], tag)
+		},
+	}
+
+	cmd.Flags().StringVar(&tag, "tag", "latest", "Image tag to pull (default: latest)")
+
+	return cmd
+}
+
+func runPull(ctx context.Context, appName, tag string) error {
+	vpsCfg, appCfg, err := loadConfigs(appName)
+	if err != nil {
+		return err
+	}
+	appDir := vpsCfg.AppDir(appName)
+	opts := composeOpts(vpsCfg, appCfg)
+
+	// Validate.
+	if appCfg.RegistryImage == "" {
+		return fmt.Errorf("registry_image not configured in %s/app.yaml", appDir)
+	}
+
+	fmt.Println("==> Validating prerequisites")
+	if err := docker.Info(ctx); err != nil {
+		return fmt.Errorf("docker is not accessible: %w", err)
+	}
+
+	// Check infrastructure is running.
+	for _, svc := range []string{"db", "kv"} {
+		running, _ := docker.ComposeIsRunning(ctx, opts, svc)
+		if !running {
+			return fmt.Errorf("%s is not running — run 'deploy setup %s' first", svc, appName)
+		}
+	}
+
+	// Authenticate to registry.
+	registryToken := os.Getenv(appCfg.RegistryToken)
+	if registryToken == "" {
+		return fmt.Errorf("%s environment variable is required for registry auth", appCfg.RegistryToken)
+	}
+
+	imageRef := appCfg.RegistryImageRef(tag)
+	fmt.Printf("==> Logging in to registry\n")
+	if err := docker.Login(ctx, "ghcr.io", "deploy", registryToken); err != nil {
+		return fmt.Errorf("registry login: %w", err)
+	}
+
+	// Pull image.
+	fmt.Printf("==> Pulling %s\n", imageRef)
+	if err := docker.Pull(ctx, imageRef); err != nil {
+		return fmt.Errorf("pull image: %w", err)
+	}
+
+	// Save previous state for rollback.
+	prevImageID, _ := docker.InspectID(ctx, appCfg.AppImage()+":latest")
+	if prevImageID != "" {
+		_ = state.WritePreviousImageID(appDir, prevImageID)
+	}
+
+	composeDst := filepath.Join(appDir, appCfg.ComposeFile)
+	if _, err := os.Stat(composeDst); err == nil {
+		copyFile(composeDst, composeDst+".prev")
+	}
+
+	// Tag pulled image as latest.
+	if err := docker.Tag(ctx, imageRef, appCfg.AppImage()+":latest"); err != nil {
+		return fmt.Errorf("tag image: %w", err)
+	}
+
+	// Fetch artifacts (compose, docker/, db/, .versions) via sparse checkout.
+	tmpDir, err := os.MkdirTemp("", "vps-pull-*")
+	if err != nil {
+		return fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	srcDir := filepath.Join(tmpDir, "src")
+	fmt.Println("==> Fetching deployment artifacts")
+	artifactPaths := []string{"docker-compose.yml", "docker/", "db/", ".versions"}
+	if err := repo.FetchArtifacts(ctx, appCfg.Repo, appCfg.Branch, srcDir, artifactPaths, appCfg.GithubToken); err != nil {
+		return fmt.Errorf("fetch artifacts: %w", err)
+	}
+
+	// Copy artifacts to app directory.
+	fmt.Println("==> Copying artifacts")
+	if err := copyArtifacts(srcDir, appDir, appCfg.ComposeFile); err != nil {
+		return err
+	}
+
+	// Parse versions for compose env.
+	versions, err := repo.ParseVersions(srcDir)
+	if err != nil {
+		return err
+	}
+	opts.Env = versions
+
+	// Restart with health check.
+	if err := restartWithHealthCheck(ctx, vpsCfg, appCfg, opts, prevImageID); err != nil {
+		return err
+	}
+
+	// Record successful deployment.
+	_ = state.WriteDeployedSHA(appDir, tag)
+	_ = state.ClearPreviousImageID(appDir)
+
+	fmt.Println("")
+	fmt.Println("==> Deployment complete")
+	fmt.Printf("    Image:   %s\n", imageRef)
+	if appCfg.Domain != "" {
+		scheme := "http"
+		if appCfg.InternalTLS {
+			scheme = "https"
+		}
+		fmt.Printf("    URL:     %s://%s\n", scheme, appCfg.Domain)
+	}
+	return nil
+}
+
+// restartWithHealthCheck handles starting/restarting the app, connecting to
+// the Caddy network, running health checks, and rolling back on failure.
+func restartWithHealthCheck(
+	ctx context.Context,
+	vpsCfg config.VPSConfig,
+	appCfg config.AppConfig,
+	opts docker.ComposeOpts,
+	prevImageID string,
+) error {
+	containerName := appCfg.ProjectName + "-app-1"
+
+	if prevImageID == "" {
+		fmt.Println("==> Starting app service")
+		if err := docker.ComposeUp(ctx, opts, []string{"app"}, false); err != nil {
+			return fmt.Errorf("start app: %w", err)
+		}
+	} else {
+		fmt.Println("==> Restarting app service")
+		if err := docker.ComposeRecreate(ctx, opts, []string{"app"}); err != nil {
+			return fmt.Errorf("restart app: %w", err)
+		}
+	}
+
+	// Connect app to Caddy network.
+	_ = docker.NetworkConnect(ctx, vpsCfg.CaddyNetwork, containerName)
+
+	// Health check.
+	if appCfg.HealthURL != "" {
+		fmt.Println("==> Waiting for health check...")
+		if err := health.Check(ctx, appCfg.HealthURL, appCfg.HealthRetries, 2*time.Second); err != nil {
+			fmt.Printf("ERROR: %v\n", err)
+
+			// Show logs.
+			fmt.Println("==> Recent logs:")
+			_ = docker.ComposeLogs(ctx, opts, "app", 50)
+
+			// Rollback.
+			if prevImageID != "" {
+				fmt.Println("==> Rolling back to previous version...")
+				_ = docker.ComposeStop(ctx, opts, []string{"app"})
+				_ = docker.Tag(ctx, prevImageID, appCfg.AppImage()+":latest")
+
+				composePath := filepath.Join(vpsCfg.AppDir(appCfg.Name), appCfg.ComposeFile)
+				if _, err := os.Stat(composePath + ".prev"); err == nil {
+					copyFile(composePath+".prev", composePath)
+				}
+				_ = docker.ComposeRecreate(ctx, opts, []string{"app"})
+				_ = docker.NetworkConnect(ctx, vpsCfg.CaddyNetwork, containerName)
+				fmt.Println("    Rolled back to previous version")
+			} else {
+				fmt.Println("    No previous version to roll back to (initial deploy)")
+			}
+			return fmt.Errorf("deployment failed: health check did not pass")
+		}
+	}
+
 	return nil
 }
 

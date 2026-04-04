@@ -24,6 +24,8 @@ type AppConfig struct {
 	HealthRetries int    `yaml:"health_retries"`
 	InternalTLS   bool   `yaml:"internal_tls"`
 	GithubToken   string `yaml:"github_token_env"`
+	RegistryImage string `yaml:"registry_image"`     // e.g. "ghcr.io/go-sum/forge"
+	RegistryToken string `yaml:"registry_token_env"` // env var name for registry auth
 }
 
 // ApplyDefaults fills in zero-valued fields with sensible defaults.
@@ -49,6 +51,9 @@ func (a *AppConfig) ApplyDefaults() {
 	if a.GithubToken == "" {
 		a.GithubToken = "GITHUB_ACCESS_TOKEN"
 	}
+	if a.RegistryToken == "" {
+		a.RegistryToken = "GHCR_TOKEN"
+	}
 }
 
 // UpstreamHost returns the Docker container hostname for Caddy to reverse proxy to.
@@ -60,6 +65,15 @@ func (a AppConfig) UpstreamHost() string {
 // AppImage returns the Docker image name used for the app.
 func (a AppConfig) AppImage() string {
 	return a.Name
+}
+
+// RegistryImageRef returns the full registry image reference with tag.
+// If tag is empty, defaults to "latest".
+func (a AppConfig) RegistryImageRef(tag string) string {
+	if tag == "" {
+		tag = "latest"
+	}
+	return a.RegistryImage + ":" + tag
 }
 
 // LoadAppConfig reads an app config from the given directory.

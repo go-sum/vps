@@ -63,6 +63,24 @@ func Tag(ctx context.Context, src, dst string) error {
 	return run(ctx, "tag", src, dst)
 }
 
+// Pull pulls a Docker image from a registry.
+func Pull(ctx context.Context, image string) error {
+	return run(ctx, "pull", image)
+}
+
+// Login authenticates to a Docker registry using --password-stdin.
+func Login(ctx context.Context, registry, username, token string) error {
+	cmd := exec.CommandContext(ctx, "docker", "login", registry,
+		"--username", username, "--password-stdin")
+	cmd.Stdin = strings.NewReader(token)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker login %s: %w", registry, err)
+	}
+	return nil
+}
+
 // InspectLabel returns the value of a label on a Docker image or container.
 // Returns empty string if the image/label does not exist.
 func InspectLabel(ctx context.Context, target, label string) (string, error) {

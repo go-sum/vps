@@ -78,3 +78,47 @@ func BuildArgsFromVersions(versions map[string]string) map[string]string {
 	}
 	return args
 }
+
+// FetchArtifacts performs a sparse checkout of specific paths from a remote repo.
+// It clones only the requested paths into destDir using minimal bandwidth.
+// tokenEnvVar is the name of the env var holding a GitHub token (for private repos).
+// If the env var is empty, cloning proceeds without authentication (public repos).
+func FetchArtifacts(ctx context.Context, repoURL, branch, destDir string, paths []string, tokenEnvVar string) error {
+	// Configure git auth for private repos via .netrc.
+	token := os.Getenv(tokenEnvVar)
+	if token != "" {
+		netrcPath := filepath.Join(os.TempDir(), ".netrc-fetch-artifacts")
+		content := fmt.Sprintf("machine github.com\nlogin x-access-token\npassword %s\n", token)
+		if err := os.WriteFile(netrcPath, []byte(content), 0o600); err != nil {
+			return fmt.Errorf("write netrc: %w", err)
+		}
+		defer os.Remove(netrcPath)
+		os.Setenv("NETRC", netrcPath)
+		defer os.Unsetenv("NETRC")
+	}
+
+	// Sparse clone — downloads only tree metadata, no file content yet.
+	cloneCmd := exec.CommandContext(ctx, "git", "clone",
+		"--depth", "1",
+		"--sparse",
+		"--filter=blob:none",
+		"--branch", branch,
+		repoURL, destDir,
+	)
+	cloneCmd.Stdout = os.Stdout
+	cloneCmd.Stderr = os.Stderr
+	if err := cloneCmd.Run(); err != nil {
+		return fmt.Errorf("sparse clone %s (branch %s): %w", repoURL, branch, err)
+	}
+
+	// Set sparse-checkout to only the requested paths.
+	args := append([]string{"-C", destDir, "sparse-checkout", "set"}, paths...)
+	sparseCmd := exec.CommandContext(ctx, "git", args...)
+	sparseCmd.Stdout = os.Stdout
+	sparseCmd.Stderr = os.Stderr
+	if err := sparseCmd.Run(); err != nil {
+		return fmt.Errorf("sparse-checkout set: %w", err)
+	}
+
+	return nil
+}
