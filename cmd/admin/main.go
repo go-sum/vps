@@ -246,6 +246,7 @@ func appAddCmd() *cobra.Command {
 		domain      string
 		port        int
 		internalTLS bool
+		registry    string
 	)
 
 	cmd := &cobra.Command{
@@ -267,11 +268,12 @@ func appAddCmd() *cobra.Command {
 			}
 
 			appCfg := config.AppConfig{
-				Name:        name,
-				Repo:        repo,
-				Branch:      branch,
-				Domain:      domain,
-				InternalTLS: internalTLS,
+				Name:          name,
+				Repo:          repo,
+				Branch:        branch,
+				Domain:        domain,
+				InternalTLS:   internalTLS,
+				RegistryImage: registry,
 			}
 			if port != 0 {
 				appCfg.UpstreamPort = port
@@ -306,6 +308,7 @@ func appAddCmd() *cobra.Command {
 	cmd.Flags().StringVar(&domain, "domain", "", "Domain name for Caddy (required)")
 	cmd.Flags().IntVar(&port, "port", 0, "Upstream port (default: 8080)")
 	cmd.Flags().BoolVar(&internalTLS, "internal-tls", true, "Use Caddy internal TLS")
+	cmd.Flags().StringVar(&registry, "registry", "", "GHCR image path for deploy pull (e.g. ghcr.io/go-sum/forge)")
 	_ = cmd.MarkFlagRequired("repo")
 	_ = cmd.MarkFlagRequired("domain")
 

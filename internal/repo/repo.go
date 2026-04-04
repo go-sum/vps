@@ -112,7 +112,8 @@ func FetchArtifacts(ctx context.Context, repoURL, branch, destDir string, paths 
 	}
 
 	// Set sparse-checkout to only the requested paths.
-	args := append([]string{"-C", destDir, "sparse-checkout", "set"}, paths...)
+	// Use --no-cone to support individual file patterns (not just directories).
+	args := append([]string{"-C", destDir, "sparse-checkout", "set", "--no-cone"}, paths...)
 	sparseCmd := exec.CommandContext(ctx, "git", args...)
 	sparseCmd.Stdout = os.Stdout
 	sparseCmd.Stderr = os.Stderr

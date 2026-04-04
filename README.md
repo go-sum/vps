@@ -163,7 +163,10 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/deploy ./cmd/deploy
 ### Deploy to Server
 
 ```bash
-scp bin/admin bin/deploy user@server:/usr/local/bin/
+mkdir -p /opt/vps/bin
+scp bin/admin bin/deploy user@server:/opt/vps/bin/
+ln -s /opt/vps/bin/admin /usr/local/bin/admin
+ln -s /opt/vps/bin/deploy /usr/local/bin/deploy
 ```
 
 ---
