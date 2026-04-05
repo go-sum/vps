@@ -27,8 +27,13 @@ version: ## Show current version tag
 	@echo $(VERSION)
 
 release: ## Create and push a new version tag (override: make release V=v1.0.0)
-	@latest=$$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0"); \
-	next=$${V:-$$(echo $$latest | awk -F. '{print $$1"."$$2"."$$3+1}')}; \
-	echo "Tagging $$next (was $$latest)"; \
+	@latest=$$(git describe --tags --abbrev=0 2>/dev/null || echo ""); \
+	if [ -n "$$latest" ] && [ -z "$$(git log $$latest..HEAD --oneline)" ]; then \
+		echo "No changes since $$latest — nothing to release"; \
+		exit 1; \
+	fi; \
+	prev=$${latest:-v0.0.0}; \
+	next=$${V:-$$(echo $$prev | awk -F. '{print $$1"."$$2"."$$3+1}')}; \
+	echo "Tagging $$next (was $$prev)"; \
 	git tag -a "$$next" -m "Release $$next" && \
 	git push origin "$$next"
