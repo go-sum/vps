@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"text/template"
 
-	"github.com/caasmo/vps/internal/config"
+	"github.com/go-sum/vps/internal/config"
 )
 
 //go:embed caddyfile.tmpl

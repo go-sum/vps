@@ -8,27 +8,32 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/caasmo/vps/internal/config"
-	"github.com/caasmo/vps/internal/docker"
-	"github.com/caasmo/vps/internal/health"
-	"github.com/caasmo/vps/internal/repo"
-	"github.com/caasmo/vps/internal/state"
+	"github.com/go-sum/vps/internal/config"
+	"github.com/go-sum/vps/internal/docker"
+	"github.com/go-sum/vps/internal/health"
+	"github.com/go-sum/vps/internal/repo"
+	"github.com/go-sum/vps/internal/state"
 )
 
-var configPath string
+var (
+	version    = "dev"
+	configPath string
+)
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
 	root := &cobra.Command{
-		Use:   "deploy",
-		Short: "Application deployment",
+		Use:     "app",
+		Short:   "Application deployment",
+		Version: version,
 	}
 	root.PersistentFlags().StringVar(&configPath, "config", "", "path to vps.yaml (default: /opt/vps/vps.yaml)")
 
@@ -36,6 +41,7 @@ func main() {
 	root.AddCommand(runCmd())
 	root.AddCommand(pullCmd())
 	root.AddCommand(statusCmd())
+	root.AddCommand(restartCmd())
 	root.AddCommand(rollbackCmd())
 
 	if err := root.ExecuteContext(ctx); err != nil {
@@ -171,7 +177,7 @@ func runSetup(ctx context.Context, appName string) error {
 	fmt.Println("==> Infrastructure provisioning complete")
 	fmt.Printf("    App dir:  %s\n", appDir)
 	fmt.Println("")
-	fmt.Println("    Next: deploy run " + appName)
+	fmt.Println("    Next: app run " + appName)
 	return nil
 }
 
@@ -227,7 +233,7 @@ func runDeploy(ctx context.Context, appName string, force bool, branchOverride s
 	for _, svc := range []string{"db", "kv"} {
 		running, _ := docker.ComposeIsRunning(ctx, opts, svc)
 		if !running {
-			return fmt.Errorf("%s is not running — run 'deploy setup %s' first", svc, appName)
+			return fmt.Errorf("%s is not running — run 'app setup %s' first", svc, appName)
 		}
 	}
 
@@ -386,7 +392,7 @@ func runPull(ctx context.Context, appName, tag string) error {
 	for _, svc := range []string{"db", "kv"} {
 		running, _ := docker.ComposeIsRunning(ctx, opts, svc)
 		if !running {
-			return fmt.Errorf("%s is not running — run 'deploy setup %s' first", svc, appName)
+			return fmt.Errorf("%s is not running — run 'app setup %s' first", svc, appName)
 		}
 	}
 
@@ -532,6 +538,44 @@ func restartWithHealthCheck(
 	return nil
 }
 
+// ── restart ──────────────────────────────────────────────────────────────────
+
+func restartCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "restart <app-name>",
+		Short: "Restart the app containers",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			vpsCfg, appCfg, err := loadConfigs(args[0])
+			if err != nil {
+				return err
+			}
+			opts := composeOpts(vpsCfg, appCfg)
+			containerName := appCfg.ProjectName + "-app-1"
+
+			fmt.Println("==> Restarting app service")
+			if err := docker.ComposeRecreate(ctx, opts, []string{"app"}); err != nil {
+				return fmt.Errorf("restart app: %w", err)
+			}
+
+			// Reconnect to caddy network.
+			_ = docker.NetworkConnect(ctx, vpsCfg.CaddyNetwork, containerName)
+
+			// Health check.
+			if appCfg.HealthURL != "" {
+				fmt.Println("==> Waiting for health check...")
+				if err := health.Check(ctx, appCfg.HealthURL, appCfg.HealthRetries, 2*time.Second); err != nil {
+					return fmt.Errorf("health check failed after restart: %w", err)
+				}
+			}
+
+			fmt.Println("==> Restart complete")
+			return nil
+		},
+	}
+}
+
 // ── status ────────────────────────────────────────────────────────────────────
 
 func statusCmd() *cobra.Command {
@@ -563,13 +607,7 @@ func statusCmd() *cobra.Command {
 			// Check Caddy network connectivity.
 			containerName := appCfg.ProjectName + "-app-1"
 			caddyContainers, _ := docker.NetworkContainers(ctx, vpsCfg.CaddyNetwork)
-			onCaddy := false
-			for _, c := range caddyContainers {
-				if c == containerName {
-					onCaddy = true
-					break
-				}
-			}
+			onCaddy := slices.Contains(caddyContainers, containerName)
 			if onCaddy {
 				fmt.Printf("Network:  connected to %s\n", vpsCfg.CaddyNetwork)
 			} else {
@@ -585,7 +623,7 @@ func statusCmd() *cobra.Command {
 			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "SERVICE\tSTATUS\tCPU\tMEMORY\tPIDs")
+			fmt.Fprintln(w, "SERVICE\tSTATUS\tHEALTH\tCPU\tMEMORY\tPIDs")
 			for _, svc := range []string{"app", "db", "kv"} {
 				container := services[svc]
 				cs, _ := docker.Stats(ctx, container)
@@ -593,11 +631,15 @@ func statusCmd() *cobra.Command {
 				if status == "" {
 					status = "stopped"
 				}
+				hlth := cs.Health
+				if hlth == "" {
+					hlth = "-"
+				}
 				mem := cs.Memory
 				if cs.MemLimit != "" {
 					mem = cs.Memory + " / " + cs.MemLimit
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", svc, status, cs.CPU, mem, cs.PIDs)
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", svc, status, hlth, cs.CPU, mem, cs.PIDs)
 			}
 			w.Flush()
 

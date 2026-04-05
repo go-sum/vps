@@ -11,25 +11,30 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/caasmo/vps/internal/caddy"
-	"github.com/caasmo/vps/internal/config"
-	"github.com/caasmo/vps/internal/docker"
+	"github.com/go-sum/vps/internal/caddy"
+	"github.com/go-sum/vps/internal/config"
+	"github.com/go-sum/vps/internal/docker"
 )
 
-var configPath string
+var (
+	version    = "dev"
+	configPath string
+)
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
 	root := &cobra.Command{
-		Use:   "admin",
-		Short: "VPS server management",
+		Use:     "server",
+		Short:   "VPS server management",
+		Version: version,
 	}
 	root.PersistentFlags().StringVar(&configPath, "config", "", "path to vps.yaml (default: /opt/vps/vps.yaml)")
 
 	root.AddCommand(setupCmd())
 	root.AddCommand(statusCmd())
+	root.AddCommand(restartCmd())
 	root.AddCommand(appCmd())
 
 	if err := root.ExecuteContext(ctx); err != nil {
@@ -126,7 +131,7 @@ func setupCmd() *cobra.Command {
 			fmt.Println("")
 			fmt.Println("==> VPS setup complete")
 			fmt.Printf("    Base dir: %s\n", cfg.BaseDir)
-			fmt.Println("    Next: admin app add <name> --repo <url> --domain <domain>")
+			fmt.Println("    Next: server app add <name> --repo <url> --domain <domain>")
 			return nil
 		},
 	}
@@ -168,6 +173,9 @@ func statusCmd() *cobra.Command {
 			if cs.Image != "" {
 				fmt.Printf("  Image:   %s\n", cs.Image)
 			}
+			if cs.Health != "" {
+				fmt.Printf("  Health:  %s\n", cs.Health)
+			}
 
 			// Caddy network.
 			fmt.Println("")
@@ -200,13 +208,17 @@ func statusCmd() *cobra.Command {
 				fmt.Println("")
 				fmt.Println("Apps:")
 				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-				fmt.Fprintln(w, "  NAME\tDOMAIN\tSTATUS\tCPU\tMEMORY")
+				fmt.Fprintln(w, "  NAME\tDOMAIN\tSTATUS\tHEALTH\tCPU\tMEMORY")
 				for _, app := range apps {
 					container := app.ProjectName + "-app-1"
 					cs, _ := docker.Stats(ctx, container)
 					status := cs.Status
 					if status == "" {
 						status = "stopped"
+					}
+					hlth := cs.Health
+					if hlth == "" {
+						hlth = "-"
 					}
 					mem := cs.Memory
 					if mem == "" {
@@ -216,11 +228,60 @@ func statusCmd() *cobra.Command {
 					if cpu == "" {
 						cpu = "-"
 					}
-					fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\n", app.Name, app.Domain, status, cpu, mem)
+					fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\t%s\n", app.Name, app.Domain, status, hlth, cpu, mem)
 				}
 				w.Flush()
 			}
 
+			return nil
+		},
+	}
+}
+
+// ── restart ──────────────────────────────────────────────────────────────────
+
+func restartCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "restart",
+		Short: "Restart Caddy and all registered app containers",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			vpsCfg, err := loadVPSConfig()
+			if err != nil {
+				return err
+			}
+
+			// Restart Caddy.
+			fmt.Println("==> Restarting Caddy")
+			caddyOpts := docker.ComposeOpts{
+				ProjectDir:  vpsCfg.CaddyDir,
+				ProjectName: "caddy",
+			}
+			if err := docker.ComposeRecreate(ctx, caddyOpts, []string{"caddy"}); err != nil {
+				return fmt.Errorf("restart caddy: %w", err)
+			}
+
+			// Restart each registered app.
+			apps, _ := config.ListApps(vpsCfg.AppsDir)
+			for _, app := range apps {
+				fmt.Printf("==> Restarting app %q\n", app.Name)
+				appDir := vpsCfg.AppDir(app.Name)
+				opts := docker.ComposeOpts{
+					ProjectDir:  appDir,
+					ProjectName: app.ProjectName,
+					EnvFile:     filepath.Join(appDir, app.EnvFile),
+				}
+				if err := docker.ComposeRecreate(ctx, opts, []string{"app"}); err != nil {
+					fmt.Printf("    Warning: %s: %v\n", app.Name, err)
+					continue
+				}
+				containerName := app.ProjectName + "-app-1"
+				_ = docker.NetworkConnect(ctx, vpsCfg.CaddyNetwork, containerName)
+				fmt.Printf("    %s restarted\n", app.Name)
+			}
+
+			fmt.Println("")
+			fmt.Println("==> Restart complete")
 			return nil
 		},
 	}
@@ -291,14 +352,14 @@ func appAddCmd() *cobra.Command {
 			if err := caddy.RegenerateCaddyfile(ctx, vpsCfg); err != nil {
 				// Non-fatal if Caddy isn't running yet.
 				fmt.Printf("    Warning: %v\n", err)
-				fmt.Println("    Run 'admin setup' first, or reload Caddy manually")
+				fmt.Println("    Run 'server setup' first, or reload Caddy manually")
 			}
 
 			fmt.Println("")
 			fmt.Printf("==> App %q registered\n", name)
 			fmt.Printf("    Domain:   %s\n", appCfg.Domain)
 			fmt.Printf("    Upstream: %s:%d\n", appCfg.UpstreamHost(), appCfg.UpstreamPort)
-			fmt.Println("    Next: deploy setup " + name)
+			fmt.Println("    Next: app setup " + name)
 			return nil
 		},
 	}
@@ -308,7 +369,7 @@ func appAddCmd() *cobra.Command {
 	cmd.Flags().StringVar(&domain, "domain", "", "Domain name for Caddy (required)")
 	cmd.Flags().IntVar(&port, "port", 0, "Upstream port (default: 8080)")
 	cmd.Flags().BoolVar(&internalTLS, "internal-tls", true, "Use Caddy internal TLS")
-	cmd.Flags().StringVar(&registry, "registry", "", "GHCR image path for deploy pull (e.g. ghcr.io/go-sum/forge)")
+	cmd.Flags().StringVar(&registry, "registry", "", "GHCR image path for app pull (e.g. ghcr.io/go-sum/forge)")
 	_ = cmd.MarkFlagRequired("repo")
 	_ = cmd.MarkFlagRequired("domain")
 

@@ -3,8 +3,8 @@
 A Go-based CLI tool for managing VPS infrastructure and deploying containerized applications. Replaces fragile bash deployment scripts with typed configuration, structured error handling, automatic rollback, and Caddy reverse proxy management.
 
 Two binaries handle separate concerns:
-- **`admin`** — VPS infrastructure: initialize the server, manage Caddy, register applications
-- **`deploy`** — Application lifecycle: build, migrate, deploy, health check, rollback
+- **`server`** — VPS infrastructure: initialize the server, manage Caddy, register applications
+- **`app`** — Application lifecycle: build, migrate, deploy, health check, rollback
 
 ---
 
@@ -12,14 +12,16 @@ Two binaries handle separate concerns:
 
 - **Caddy Reverse Proxy** — Automatic Caddyfile generation from registered apps with internal TLS, hot-reload on app add/remove
 - **Docker Compose Orchestration** — Build and manage multi-service stacks (app, PostgreSQL, Dragonfly KV) with health checks
-- **Two Deployment Paths** — Build on the server (`deploy run`) or pull a pre-built image from GHCR (`deploy pull`); both produce the same production image
+- **Two Deployment Paths** — Build on the server (`app run`) or pull a pre-built image from GHCR (`app pull`); both produce the same production image
 - **Zero-Downtime Deploys** — Build or pull new image, restart app, verify health — rollback automatically on failure
 - **Commit-SHA Tracking** — Tags images with commit SHA; skips redundant deploys when the same commit is already running; override with `--force`
 - **Registry Integration** — Build production images in GitHub Actions, push to GHCR, pull to any server — no on-server compilation needed
 - **Rollback** — Stores previous image ID and compose file; one command to restore
 - **Conditional Infrastructure** — KV service (Dragonfly) only provisioned when `DRAGONFLY_VERSION` is present in `.versions`
-- **Resource Monitoring** — `deploy status` and `admin status` show CPU, memory, and PID usage per container
-- **Caddy Network Visibility** — `admin status` lists all containers connected to the Caddy network with resource usage
+- **Resource Monitoring** — `app status` and `server status` show CPU, memory, and PID usage per container
+- **Health Status** — `app status` and `server status` show Docker healthcheck status (healthy/unhealthy/starting) per container
+- **Restart** — `app restart` restarts app containers with health check; `server restart` restarts Caddy and all app containers
+- **Caddy Network Visibility** — `server status` lists all containers connected to the Caddy network with resource usage
 - **Embedded Templates** — Caddy docker-compose.yml is compiled into the binary; no source tree needed on the server
 - **Cross-Compiled Static Binaries** — Single `scp` to deploy; no runtime dependencies beyond Docker
 
@@ -31,24 +33,24 @@ Two binaries handle separate concerns:
 
 ```bash
 # 2. Register an application
-admin app add `<appname>` --repo `<repository>` --domain `<domain>`
+server app add `<appname>` --repo `<repository>` --domain `<domain>`
 ```
 > you'll see (replace where appropriate)
 ```bash
 # 2. Register an application
-admin app add forge --repo https://github.com/go-sum/forge.git --domain forge.home
+server app add forge --repo https://github.com/go-sum/forge.git --domain forge.home
 ```
 
 ### Initial Server Setup
 
 ```bash
 # 1. Initialize VPS structure and start Caddy
-admin setup
+server setup
 
 # 2. Register an application
-admin app add `<appname>` --repo `<repository>` --domain `<domain>`
+server app add `<appname>` --repo `<repository>` --domain `<domain>`
 ## Example:
-admin app add forge --repo https://github.com/go-sum/forge.git --domain forge.home
+server app add forge --repo https://github.com/go-sum/forge.git --domain forge.home
 
 # 3. Create the app's .env file with production secrets
 vim /opt/apps/`<appname>`/.env
@@ -57,31 +59,31 @@ vim /opt/apps/forge/.env
 
 # 4. Provision infrastructure (PostgreSQL, and Dragonfly if DRAGONFLY_VERSION is in .versions)
 export GITHUB_ACCESS_TOKEN=ghp_...
-deploy setup `<appname>`
+app setup `<appname>`
 ## Example:
-deploy setup forge
+app setup forge
 ```
 
 ### Deployment options
 
 Two deployment paths are possible:
 
-#### Option A: Build on Server (`deploy run`)
+#### Option A: Build on Server (`app run`)
 
 Clones the repo on the server, builds the production tools image (cached), builds the app image, and restarts. Best for fast iteration when the server has sufficient resources.
 
 ```bash
 # Deploy latest commit from configured branch
-deploy run forge
+app run forge
 
 # Deploy from a different branch
-deploy run forge --branch staging
+app run forge --branch staging
 
 # Force deploy even if same commit is already running
-deploy run forge --force
+app run forge --force
 ```
 
-#### Option B: Pull from Registry (`deploy pull`)
+#### Option B: Pull from Registry (`app pull`)
 
 Pulls a pre-built image from GHCR and restarts. No compilation on the server — only a sparse checkout of orchestration files (compose, db/, .versions). Best for production servers with limited resources or when build consistency matters.
 
@@ -92,46 +94,56 @@ Pulls a pre-built image from GHCR and restarts. No compilation on the server —
 # 3. Trigger a CI build via GitHub Actions (workflow_dispatch or tag push)
 
 # Pull latest image from registry
-deploy pull forge
+app pull forge
 
 # Pull a specific tagged version
-deploy pull forge --tag v1.0
+app pull forge --tag v1.0
 
 # Pull a specific commit build
-deploy pull forge --tag abc123f
+app pull forge --tag abc123f
 ```
 
 #### Rollback (works with both options)
 
 ```bash
-deploy rollback forge
+app rollback forge
+```
+
+### Restart
+
+```bash
+# Restart a specific app's containers (with health check)
+app restart forge
+
+# Restart Caddy and all registered app containers
+server restart
 ```
 
 ### Monitoring
 
 ```bash
-# App deployment status with resource usage
-deploy status forge
+# App deployment status with resource usage and health
+app status forge
 
-# VPS-wide overview: Caddy, network, all apps
-admin status
+# VPS-wide overview: Caddy, network, all apps with health
+server status
 ```
 
 ### Managing Applications
 
 ```bash
 # List all registered apps
-admin app list
+server app list
 
 # Add a new app
-admin app add myapp \
+server app add myapp \
   --repo https://github.com/user/myapp.git \
   --domain myapp.example.com \
   --branch main \
   --port 3000
 
 # Remove an app (removes config and updates Caddyfile)
-admin app remove myapp
+server app remove myapp
 ```
 
 ---
@@ -152,38 +164,39 @@ git clone https://github.com/go-sum/vps.git
 cd vps
 
 # Build for the local machine
-go build -o bin/admin ./cmd/admin
-go build -o bin/deploy ./cmd/deploy
+go build -o bin/server ./cmd/server
+go build -o bin/app ./cmd/app
 
 # Cross-compile for x86_64 Linux (e.g., Debian VPS)
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/admin ./cmd/admin
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/deploy ./cmd/deploy
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/server ./cmd/server
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/app ./cmd/app
 ```
 
 ### Deploy to Server
 
 ```bash
 mkdir -p /opt/vps/bin
-scp bin/admin bin/deploy user@server:/opt/vps/bin/
-ln -s /opt/vps/bin/admin /usr/local/bin/admin
-ln -s /opt/vps/bin/deploy /usr/local/bin/deploy
+scp bin/server bin/app user@server:/opt/vps/bin/
+ln -s /opt/vps/bin/server /usr/local/bin/server
+ln -s /opt/vps/bin/app /usr/local/bin/app
 ```
 
 ---
 
 ### Command Reference
 
-#### `admin`
+#### `server`
 
 | Command | Description |
 |---------|-------------|
-| `admin setup` | Create directory structure, write Caddy config, start Caddy container |
-| `admin status` | Show Caddy status, network containers, and per-app resource usage |
-| `admin app add <name>` | Register an app and update Caddy reverse proxy |
-| `admin app list` | List all registered apps |
-| `admin app remove <name>` | Remove an app and update Caddy |
+| `server setup` | Create directory structure, write Caddy config, start Caddy container |
+| `server status` | Show Caddy status, network containers, and per-app resource usage with health |
+| `server restart` | Restart Caddy and all registered app containers |
+| `server app add <name>` | Register an app and update Caddy reverse proxy |
+| `server app list` | List all registered apps |
+| `server app remove <name>` | Remove an app and update Caddy |
 
-**`admin app add` flags:**
+**`server app add` flags:**
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
@@ -193,24 +206,25 @@ ln -s /opt/vps/bin/deploy /usr/local/bin/deploy
 | `--port` | No | `8080` | Upstream container port |
 | `--internal-tls` | No | `true` | Use Caddy's internal TLS |
 
-#### `deploy`
+#### `app`
 
 | Command | Description |
 |---------|-------------|
-| `deploy setup <app>` | Clone repo, build infrastructure images (db, kv if configured), start services |
-| `deploy run <app>` | Build tools + app image on server, restart, health check, rollback on failure |
-| `deploy pull <app>` | Pull pre-built image from GHCR, fetch artifacts, restart, health check, rollback on failure |
-| `deploy status <app>` | Show deployment state, network connectivity, container resource usage |
-| `deploy rollback <app>` | Restore previous image and compose file, restart app, re-run health check |
+| `app setup <app>` | Clone repo, build infrastructure images (db, kv if configured), start services |
+| `app run <app>` | Build tools + app image on server, restart, health check, rollback on failure |
+| `app pull <app>` | Pull pre-built image from GHCR, fetch artifacts, restart, health check, rollback on failure |
+| `app status <app>` | Show deployment state, network connectivity, container resource usage with health |
+| `app restart <app>` | Restart app containers, reconnect to Caddy network, run health check |
+| `app rollback <app>` | Restore previous image and compose file, restart app, re-run health check |
 
-**`deploy run` flags:**
+**`app run` flags:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--force` | `false` | Deploy even if the same commit SHA is already deployed |
 | `--branch` | (from app.yaml) | Override the configured branch for this deploy |
 
-**`deploy pull` flags:**
+**`app pull` flags:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -239,7 +253,7 @@ ln -s /opt/vps/bin/deploy /usr/local/bin/deploy
 
 ### VPS Config (`/opt/vps/vps.yaml`)
 
-Created by `admin setup`. Controls the directory layout and network settings.
+Created by `server setup`. Controls the directory layout and network settings.
 
 ```yaml
 base_dir: /opt                # Root directory
@@ -250,7 +264,7 @@ caddy_network: caddy_net      # Docker network connecting Caddy to apps
 
 ### App Config (`/opt/apps/<name>/app.yaml`)
 
-Created by `admin app add`. Controls how the app is built, deployed, and proxied.
+Created by `server app add`. Controls how the app is built, deployed, and proxied.
 
 ```yaml
 name: forge                                         # App identifier
@@ -265,7 +279,7 @@ health_url: https://localhost/health                # Health check endpoint (emp
 health_retries: 30                                  # Max health check attempts (2s interval)
 internal_tls: true                                  # Caddy internal TLS
 github_token_env: GITHUB_ACCESS_TOKEN               # Env var name for GitHub PAT
-registry_image: ghcr.io/go-sum/forge                # GHCR image path (required for deploy pull)
+registry_image: ghcr.io/go-sum/forge                # GHCR image path (required for app pull)
 registry_token_env: GHCR_TOKEN                      # Env var name for registry auth (default: GHCR_TOKEN)
 ```
 
@@ -273,12 +287,12 @@ registry_token_env: GHCR_TOKEN                      # Env var name for registry 
 
 | Variable | Required By | Description |
 |----------|-------------|-------------|
-| `GITHUB_ACCESS_TOKEN` | `deploy run`, `deploy setup` | GitHub PAT for cloning private repos and downloading private Go modules during on-server builds |
-| `GHCR_TOKEN` | `deploy pull` | GitHub PAT with `read:packages` scope for pulling images from GHCR |
+| `GITHUB_ACCESS_TOKEN` | `app run`, `app setup` | GitHub PAT for cloning private repos and downloading private Go modules during on-server builds |
+| `GHCR_TOKEN` | `app pull` | GitHub PAT with `read:packages` scope for pulling images from GHCR |
 
 ### App `.env` File (`/opt/apps/<name>/.env`)
 
-Must be created manually before running `deploy setup`. Contains production secrets read by Docker Compose and the application:
+Must be created manually before running `app setup`. Contains production secrets read by Docker Compose and the application:
 
 ```env
 PGUSER=postgres
@@ -302,7 +316,7 @@ The application repository must contain:
 | `db/migrations/` | Versioned SQL migration files (applied by the app on startup when `auto_migrate: true`) |
 | `db/init/01-extensions.sql` | PostgreSQL extensions (citext) |
 
-Both `deploy run` and `deploy pull` copy the `docker/` directory to the app directory. `deploy run` builds the production tools image (`docker/tools/Dockerfile` target `production_tools`) on the server before building the app — this image is cached and only rebuilds when Hugo or Tailwind versions change. `deploy pull` skips all building and pulls a pre-built image from GHCR instead.
+Both `app run` and `app pull` copy the `docker/` directory to the app directory. `app run` builds the production tools image (`docker/tools/Dockerfile` target `production_tools`) on the server before building the app — this image is cached and only rebuilds when Hugo or Tailwind versions change. `app pull` skips all building and pulls a pre-built image from GHCR instead.
 
 ---
 
@@ -354,7 +368,7 @@ After setup, the server filesystem looks like:
 
 Both workflows share the same restart, health check, and rollback logic. They differ only in how the production image is obtained.
 
-### `deploy run` — Build on Server
+### `app run` — Build on Server
 
 1. **Validate** — Check Docker, .env file, GitHub token, running infrastructure (db, kv)
 2. **Clone** — Shallow clone (`--depth 1`) of the configured branch to a temp directory
@@ -371,7 +385,7 @@ Both workflows share the same restart, health check, and rollback logic. They di
 13. **Record** — Write deployed SHA; clear rollback state
 14. **Rollback** (on failure) — Show last 50 lines of app logs, restore previous image and compose file, restart
 
-### `deploy pull` — Pull from Registry
+### `app pull` — Pull from Registry
 
 1. **Validate** — Check Docker, `registry_image` configured, `GHCR_TOKEN` set, running infrastructure (db, kv)
 2. **Login** — Authenticate to GHCR via `docker login --password-stdin`
@@ -381,11 +395,11 @@ Both workflows share the same restart, health check, and rollback logic. They di
 6. **Fetch Artifacts** — Sparse git checkout of `docker-compose.yml`, `docker/`, `db/`, `.versions` (~100KB)
 7. **Copy Artifacts** — Copy fetched files to app directory
 8. **Parse Versions** — Read `.versions` for compose environment
-9. **Restart** — Same as `deploy run` step 10
+9. **Restart** — Same as `app run` step 10
 10. **Network** — Connect app container to Caddy network
-11. **Health Check** — Same as `deploy run` step 12
+11. **Health Check** — Same as `app run` step 12
 12. **Record** — Write deployed tag; clear rollback state
-13. **Rollback** (on failure) — Same as `deploy run` step 14
+13. **Rollback** (on failure) — Same as `app run` step 14
 
 ### GitHub Actions CI Build
 
@@ -394,7 +408,7 @@ The repository includes a workflow (`.github/workflows/build-image.yml`) that bu
 - **Manual dispatch** (`workflow_dispatch`) — with an optional `tag` input
 - **Tag push** (`v*`) — uses the git tag as the image tag
 
-The workflow builds the same `production_target` as `deploy run`, tags the image as both `:<tag>` and `:latest`, and cleans up old versions (keeps the last 5).
+The workflow builds the same `production_target` as `app run`, tags the image as both `:<tag>` and `:latest`, and cleans up old versions (keeps the last 5).
 
 **Required GitHub Secrets:**
 
@@ -415,8 +429,8 @@ Migrations are handled by the application itself on startup when `auto_migrate: 
 
 Go to **Settings > Developer settings > Personal access tokens > Fine-grained tokens** and create two tokens:
 
-1. **`PACKAGES_TOKEN`** (for CI / `deploy run`) — scopes: `read:packages`, `write:packages`
-2. **`GHCR_TOKEN`** (for `deploy pull`) — scope: `read:packages` only
+1. **`PACKAGES_TOKEN`** (for CI / `app run`) — scopes: `read:packages`, `write:packages`
+2. **`GHCR_TOKEN`** (for `app pull`) — scope: `read:packages` only
 
 See [Managing your personal access tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens) for detailed instructions.
 

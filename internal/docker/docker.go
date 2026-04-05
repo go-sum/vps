@@ -151,6 +151,7 @@ type ContainerStats struct {
 	PIDs     string
 	Uptime   string
 	Image    string
+	Health   string // "healthy", "unhealthy", "starting", or "" (no healthcheck)
 }
 
 // Stats returns resource usage for a running container.
@@ -177,15 +178,18 @@ func Stats(ctx context.Context, container string) (ContainerStats, error) {
 		cs.PIDs = parts[3]
 	}
 
-	// Get status and uptime from inspect.
+	// Get status, uptime, and health from inspect.
 	statusOut, err := output(ctx, "inspect", "--format",
-		"{{.State.Status}}\t{{.State.StartedAt}}\t{{.Config.Image}}", container)
+		"{{.State.Status}}\t{{.State.StartedAt}}\t{{.Config.Image}}\t{{if .State.Health}}{{.State.Health.Status}}{{end}}", container)
 	if err == nil {
 		sp := strings.Split(strings.TrimSpace(statusOut), "\t")
 		if len(sp) >= 3 {
 			cs.Status = sp[0]
 			cs.Uptime = sp[1]
 			cs.Image = sp[2]
+		}
+		if len(sp) >= 4 && sp[3] != "" {
+			cs.Health = sp[3]
 		}
 	}
 

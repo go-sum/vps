@@ -1,4 +1,4 @@
-module github.com/caasmo/vps
+module github.com/go-sum/vps
 
 go 1.26.0
 
