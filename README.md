@@ -451,6 +451,8 @@ See [Manually running a workflow](https://docs.github.com/en/actions/managing-wo
 ```bash
 git tag v1.0.0
 git push origin v1.0.0
+# or use
+make release 
 ```
 
 This triggers the workflow automatically and tags the image as `v1.0.0`. 
