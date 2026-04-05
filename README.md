@@ -152,29 +152,29 @@ server app remove myapp
 
 ### Prerequisites
 
-- Go 1.26+ (build machine only)
 - Docker and Docker Compose plugin (target server)
 - Git (target server)
 
-### Build
+### Quick Install (recommended)
+
+Download the latest release and install to `/opt/vps/bin/` with symlinks in `/usr/local/bin/`:
 
 ```bash
-# Clone the repository
+curl -fsSL https://raw.githubusercontent.com/go-sum/vps/main/scripts/install_update.sh | bash
+```
+
+This detects your OS and architecture automatically. Run the same command to update to the latest version.
+
+### Build from Source
+
+```bash
 git clone https://github.com/go-sum/vps.git
 cd vps
 
-# Build for the local machine
-go build -o bin/server ./cmd/server
-go build -o bin/app ./cmd/app
+# Cross-compile for x86_64 Linux (default)
+make build
 
-# Cross-compile for x86_64 Linux (e.g., Debian VPS)
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/server ./cmd/server
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/app ./cmd/app
-```
-
-### Deploy to Server
-
-```bash
+# Deploy to server
 mkdir -p /opt/vps/bin
 scp bin/server bin/app user@server:/opt/vps/bin/
 ln -s /opt/vps/bin/server /usr/local/bin/server
